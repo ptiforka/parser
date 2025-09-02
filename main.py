@@ -131,6 +131,17 @@ def main():
         t0 = time.perf_counter()
         try:
             top, sc, dt_ms, etag, xrt = fetch_top_notice()  # ← теперь есть мета
+
+            payload = {
+                "title": sc,
+                "found_at": now_iso(),
+                "server": SERVER_NAME,
+                "notice_id": str(cur_id),
+                "url": url,
+                "ticker": extract_ticker(title) or "",
+            }
+            n = rds.publish(CHANNEL, json.dumps(payload, ensure_ascii=False))
+            print(f"[NEW] id={cur_id} title={title} | subs={n}")
             if top:
                 cur_id = int(top.get("id", 0))
                 title = top.get("title", "") or ""
