@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import os, time, math, json, re, random, socket
@@ -136,12 +135,9 @@ def main():
                 "title": sc,
                 "found_at": now_iso(),
                 "server": SERVER_NAME,
-                "notice_id": str(cur_id),
-                "url": url,
-                "ticker": extract_ticker(title) or "",
+                "notice_id": sc,
             }
             n = rds.publish(CHANNEL, json.dumps(payload, ensure_ascii=False))
-            print(f"[NEW] id={cur_id} title={title} | subs={n}")
             if top:
                 cur_id = int(top.get("id", 0))
                 title = top.get("title", "") or ""
