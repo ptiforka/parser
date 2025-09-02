@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import os, time, math, json, re, random, socket
@@ -8,8 +9,8 @@ from fake_useragent import UserAgent
 
 # --------- Конфиг ---------
 API_BASE = "https://api-manager.upbit.com/api/v1/announcements.json"
-REQUEST_TIMEOUT = (2, 3)  # (connect, read)
-PERIOD_SEC = 5            # частота одного сервера = 1 раз в 5 сек
+REQUEST_TIMEOUT = (2, 3)   # (connect, read)
+PERIOD_SEC = 4             # частота одного сервера = 1 раз в 4 сек
 CHANNEL = os.getenv("REDIS_CHAN", "announces")
 
 REDIS_HOST = os.getenv("REDIS_HOST", "127.0.0.1")
@@ -17,14 +18,9 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_PASS = os.getenv("REDIS_PASS", "")
 SERVER_NAME = os.getenv("SERVER_NAME", socket.gethostname())
 
-# Стартовый ID (если не задан — возьмём текущую верхнюю запись как базовую)
-START_TARGET_ID = os.getenv("START_TARGET_ID")
+START_TARGET_ID = os.getenv("START_TARGET_ID")  # строка из env
+SLOT_ENV = os.getenv("SLOT")                    # опционально 0..3
 
-# Слот (0..4) для точного распределения запросов по секундам; если не задан — авто.
-SLOT_ENV = os.getenv("SLOT")
-AUTO_SLOT = None
-
-# Игнорировать брендовые заголовки (как в твоей логике)
 BRAND_MARKER = "업비트(Upbit)"
 
 # Тикер из заголовка
@@ -32,8 +28,9 @@ TICKER_RE = re.compile(r"\(([A-Z0-9._-]+)\)[^\n]*?(?:신규\s*거래지원\s*안
 
 ua = UserAgent()
 
-def now_iso():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+def now_iso_ms() -> str:
+    # ISO-8601 UTC с миллисекундами (RFC3339-like)
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 def rand_headers():
     return {
@@ -46,15 +43,15 @@ def rand_headers():
     }
 
 def build_url():
-    # минимальный вариант + рандомный bc чтобы лучше обходить кеши
     params = {
         "os": "android",
         "page": "1",
         "per_page": "1",
         "category": "a",
-        "bc": str(int(time.time()*1000)) + str(random.randint(100,999)),
+        # анти-кешовый параметр
+        "bc": str(int(time.time() * 1000)) + str(random.randint(100, 999)),
     }
-    qs = "&".join(f"{k}={v}" for k,v in params.items())
+    qs = "&".join(f"{k}={v}" for k, v in params.items())
     return f"{API_BASE}?{qs}"
 
 def fetch_top_notice():
@@ -69,7 +66,6 @@ def fetch_top_notice():
         xrt  = resp.headers.get("X-Runtime", "-")
         size = len(resp.content)
 
-        # лог запроса
         print(f"[req] status={sc} | {dt_ms:.1f} ms | size={size} | etag={etag} | xrt={xrt}")
 
         top = None
@@ -78,11 +74,12 @@ def fetch_top_notice():
             notices = (data.get("data") or {}).get("notices") or []
             top = notices[0] if notices else None
 
-        return top, sc, dt_ms, etag, xrt
+        return {"top": top, "code": sc, "rt_ms": dt_ms, "etag": etag, "x_runtime": xrt, "size": size, "url": url}
     except requests.RequestException as e:
         dt_ms = (time.perf_counter() - t0) * 1000.0
         print(f"[req] ERROR after {dt_ms:.1f} ms: {e}")
-        return None, None, dt_ms, "-", "-"
+        # унифицированная структура для ошибок сети
+        return {"top": None, "code": None, "rt_ms": dt_ms, "etag": "-", "x_runtime": "-", "size": 0, "url": url, "error": str(e)}
 
 def extract_ticker(title: str):
     if not title:
@@ -91,88 +88,99 @@ def extract_ticker(title: str):
     return m.group(1) if m else None
 
 def get_slot():
-    s = random.SystemRandom().randint(0, 4)
-    return s
+    # для периода 4 сек слоты 0..3
+    if SLOT_ENV is not None:
+        try:
+            s = int(SLOT_ENV)
+            if 0 <= s <= 3:
+                return s
+        except ValueError:
+            pass
+    return random.SystemRandom().randint(0, 3)
 
 def align_next_tick(slot: int):
     """
-    Вычисляет ближайшее время запуска вида ... секунд, где (sec % 5) == slot,
-    затем ждём до него; дальше в цикле всегда +5 секунд.
+    Ждём ближайший момент, где (sec % PERIOD_SEC) == slot.
     """
     now = time.time()
-    # граница текущего целого секунда
     now_floor = math.floor(now)
-    # секунда-мишень в пределах текущих 5 сек
     base = now_floor - (now_floor % PERIOD_SEC)
     first = base + slot
-    # если уже прошли это окно — берём следующее через 5 сек
     if first <= now:
         first += PERIOD_SEC
-    # спим до точки выстрела
     sleep_s = max(0.0, first - now)
     if sleep_s > 0:
         time.sleep(sleep_s)
-    return first  # момент первого выстрела (epoch seconds)
+    return first
 
 def main():
     # Redis
-    rds = redis.Redis(host=REDIS_HOST, port=REDIS_PORT,
-                      password=REDIS_PASS or None, decode_responses=True,
-                      socket_keepalive=True)
+    rds = redis.Redis(
+        host=REDIS_HOST, port=REDIS_PORT, password=REDIS_PASS or None,
+        decode_responses=True, socket_keepalive=True
+    )
 
-    last_seen_id = int(START_TARGET_ID)
+    try:
+        last_seen_id = int(START_TARGET_ID) if START_TARGET_ID is not None else 0
+    except ValueError:
+        last_seen_id = 0
 
     slot = get_slot()
     print(f"[i] SERVER={SERVER_NAME} uses SLOT={slot} (period={PERIOD_SEC}s)")
     next_fire = align_next_tick(slot)
 
     while True:
-        t0 = time.perf_counter()
-        try:
-            top, sc, dt_ms, etag, xrt = fetch_top_notice()  # ← теперь есть мета
+        meta = fetch_top_notice()
 
-            payload = {
-                "title": sc,
-                "found_at": now_iso(),
+        # --- Шлём статус только если ошибка (не-200 или исключение) ---
+        if meta.get("code") != 200 or "error" in meta:
+            status_payload = {
+                "type": "status",
+                "found_at": now_iso_ms(),
                 "server": SERVER_NAME,
-                "notice_id": sc,
+                "slot": slot,
+                "http_code": meta.get("code"),          # 429, 500, None (если исключение)
+                "rt_ms": round(meta.get("rt_ms", 0.0), 1),
+                "etag": meta.get("etag"),
+                "x_runtime": meta.get("x_runtime"),
+                "resp_size": meta.get("size"),
+                "request_url": meta.get("url"),
             }
-            n = rds.publish(CHANNEL, json.dumps(payload, ensure_ascii=False))
-            if top:
+            if "error" in meta:
+                status_payload["error"] = meta["error"]
+
+            rds.publish(CHANNEL, json.dumps(status_payload, ensure_ascii=False))
+
+        # --- Публикуем новый анонс ---
+        top = meta.get("top")
+        if meta.get("code") == 200 and top:
+            try:
                 cur_id = int(top.get("id", 0))
-                title = top.get("title", "") or ""
-                url = f"https://upbit.com/service_center/notice?id={cur_id}"
+            except (TypeError, ValueError):
+                cur_id = 0
 
-                # игнорировать брендовые заголовки
-                if BRAND_MARKER and BRAND_MARKER in title:
-                    pass
-                else:
-                    if cur_id > last_seen_id:
-                        # нашёл НОВОЕ — публикуем в Redis PUB/SUB
-                        payload = {
-                            "title": title,
-                            "found_at": now_iso(),
-                            "server": SERVER_NAME,
-                            "notice_id": str(cur_id),
-                            "url": url,
-                            "ticker": extract_ticker(title) or "",
-                        }
-                        n = rds.publish(CHANNEL, json.dumps(payload, ensure_ascii=False))
-                        print(f"[NEW] id={cur_id} title={title} | subs={n}")
+            title = (top.get("title") or "").strip()
+            url   = f"https://upbit.com/service_center/notice?id={cur_id}"
 
-                        last_seen_id = cur_id
-            else:
-                print("[i] empty notices")
+            # отбрасываем брендовые заголовки
+            if not (BRAND_MARKER and BRAND_MARKER in title):
+                if cur_id > last_seen_id:
+                    announce_payload = {
+                        "type": "announcement",
+                        "found_at": now_iso_ms(),
+                        "server": SERVER_NAME,
+                        "notice_id": str(cur_id),
+                        "title": title,
+                        "url": url,
+                        "ticker": extract_ticker(title) or "",
+                    }
+                    n = rds.publish(CHANNEL, json.dumps(announce_payload, ensure_ascii=False))
+                    print(f"[NEW] id={cur_id} | subs={n} | {title}")
+                    last_seen_id = cur_id
 
-        except requests.HTTPError as e:
-            print(f"[http] {e}")
-        except Exception as e:
-            print(f"[err] {e}")
-
-        # рассчитываем строго следующий выстрел через 5 сек от предыдущего слота
+        # строгое выравнивание по слоту
         next_fire += PERIOD_SEC
-        now = time.time()
-        sleep_s = max(0.0, next_fire - now)
+        sleep_s = max(0.0, next_fire - time.time())
         time.sleep(sleep_s)
 
 if __name__ == "__main__":
